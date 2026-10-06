@@ -181,6 +181,62 @@ def test_insufficient_anchors_when_slope_range_too_tight():
     assert res["status"] == "insufficient_anchors"
 
 
+def test_prefilter_keeps_chebyshev_feasible_matching():
+    # Regression: the old pre-filter discarded a matching whenever the
+    # NNLS (least-squares) fit's max pointwise residual exceeded the
+    # tolerance.  NNLS minimises the L2 residual, so its fit can violate
+    # the pointwise tolerance while another ratio vector satisfies every
+    # row.  Here the single legal two-anchor matching has template == 1
+    # at three unsaturated points and sample 0, 0, 1: the NNLS ratio 1/3
+    # has max residual 2/3 > 0.51, yet r = 0.5 fits everywhere (err 0.5).
+    payload = {
+        "standards": [{"id": 1, "concentration": 2.0,
+                       "times": [0.0, 5.0, 10.0],
+                       "intensities": [1.0, 1.0, 1.0]}],
+        "reference_markers": [{"id": 1, "time": 0.0},
+                              {"id": 2, "time": 10.0}],
+        "sample": {"channel_id": "FID-1",
+                   "times": [0.0, 5.0, 10.0],
+                   "intensities": [0.0, 0.0, 1.0]},
+        "candidate_markers": [{"time": 0.0}, {"time": 10.0}],
+        "saturation": 1000.0,
+        "tolerance": 0.51,
+        "drift_slope": {"min": 0.5, "max": 2.0},
+    }
+    res = solve(payload)
+    assert res["status"] == "ok", res
+    assert res["max_pairs"] == 2
+    assert res["explanations_evaluated"] == 1
+    comp = res["components"][0]
+    # Feasible ratios: r <= 0.51 (rows 1-2) and |r - 1| <= 0.51 (row 3).
+    assert comp["ratio_lower"] == pytest.approx(0.49, abs=1e-9)
+    assert comp["ratio_upper"] == pytest.approx(0.51, abs=1e-9)
+    assert comp["concentration_lower"] == pytest.approx(0.98, abs=1e-9)
+    assert comp["concentration_upper"] == pytest.approx(1.02, abs=1e-9)
+
+
+def test_prefilter_boundary_infeasible_below_half_tolerance():
+    # Same shape with tolerance 0.49: r <= 0.49 and r >= 0.51 conflict.
+    # The sound pre-filter must NOT fire (NNLS L2 norm sqrt(2/3) is below
+    # sqrt(3) * 0.49), so the exact LP proves infeasibility.
+    payload = {
+        "standards": [{"id": 1, "concentration": 2.0,
+                       "times": [0.0, 5.0, 10.0],
+                       "intensities": [1.0, 1.0, 1.0]}],
+        "reference_markers": [{"id": 1, "time": 0.0},
+                              {"id": 2, "time": 10.0}],
+        "sample": {"channel_id": "FID-1",
+                   "times": [0.0, 5.0, 10.0],
+                   "intensities": [0.0, 0.0, 1.0]},
+        "candidate_markers": [{"time": 0.0}, {"time": 10.0}],
+        "saturation": 1000.0,
+        "tolerance": 0.49,
+        "drift_slope": {"min": 0.5, "max": 2.0},
+    }
+    res = solve(payload)
+    assert res["status"] == "infeasible", res
+
+
 def test_infeasible_when_tolerance_too_tight():
     payload, _ = make_payload(seed=5)
     payload["tolerance"] = 1e-9

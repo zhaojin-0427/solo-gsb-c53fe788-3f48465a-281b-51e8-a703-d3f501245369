@@ -364,11 +364,26 @@ def solve(payload: Any) -> dict:
         return M
 
     def quick_prune(M: np.ndarray) -> bool:
-        """Cheap necessary condition before the exact LP.
+        """Cheap *provably necessary* conditions before the exact LP.
 
-        True => provably infeasible.  NNLS minimises the unconstrained
-        (non-negativity only) residual; if even that fit violates the
-        tolerance on some unsaturated row, no feasible r exists.
+        True  => the matching is provably infeasible (safe to discard).
+        False => undecided here; the exact LP must arbitrate.
+
+        Two sound criteria are used:
+
+        * A saturated row whose template entries are all <= 0 can never
+          reach ``saturation - tolerance`` (when positive) with r >= 0.
+        * NNLS minimises ||Mu r - yu||_2 over r >= 0.  Any pointwise
+          feasible r (max |Mu r - yu| <= tol) would achieve an L2 norm
+          of at most sqrt(n) * tol, so an NNLS optimum above that bound
+          proves infeasibility.
+
+        The max pointwise residual of the least-squares fit itself
+        proves nothing: NNLS trades a few large deviations for many
+        small ones, so its fit can violate the tolerance while another
+        ratio vector (the Chebyshev one) satisfies every row.  That
+        statistic must not be used to reject a matching - uncertain
+        matchings go to the exact LP below.
         """
         if sat - tol > 0 and saturated.any():
             Ms = M[saturated]
@@ -379,7 +394,12 @@ def solve(payload: Any) -> dict:
             Mu, yu = M[unsat], sample_y[unsat]
             scale = max(float(np.linalg.norm(yu)), 1.0)
             r_nnls, _ = nnls(Mu / scale, yu / scale, maxiter=200)
-            if np.max(np.abs(Mu @ r_nnls - yu)) > tol * (1.0 + 1e-6) + 1e-7:
+            resid_l2 = float(np.linalg.norm(Mu @ r_nnls - yu))
+            l2_bound = math.sqrt(len(yu)) * tol
+            # Margin: NNLS may stop marginally above the true optimum;
+            # only a clear overshoot is a proof, borderline cases fall
+            # through to the LP.
+            if resid_l2 > l2_bound * (1.0 + 1e-9) + 1e-9:
                 return True
         return False
 
