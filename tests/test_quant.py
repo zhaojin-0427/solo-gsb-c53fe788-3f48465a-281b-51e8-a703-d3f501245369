@@ -229,6 +229,78 @@ def test_overlapping_peaks_not_forced_unique():
 
 
 # --------------------------------------------------------------------------
+# Pre-screen must be provably necessary (regression: NNLS-based pruning used
+# to discard feasible matchings)
+# --------------------------------------------------------------------------
+
+def test_l2_optimal_ratio_does_not_veto_feasible_matching():
+    # Single component; template is 1 at the only three (unsaturated) sample
+    # points; sample intensities 0, 0, 1; tolerance 0.51.  The least-squares
+    # ratio is 1/3 with worst pointwise error 2/3 > 0.51, but ratio 0.5 has
+    # every pointwise error 0.5 <= 0.51, so the unique legal two-anchor
+    # matching is feasible and must survive with the certified interval
+    # [0.49, 0.51].
+    payload = {
+        "standards": [
+            {"id": 1, "concentration": 1.0,
+             "times": [0.0, 1.0, 2.0], "intensities": [1.0, 1.0, 1.0]}
+        ],
+        "reference_markers": [{"id": 1, "time": 0.0}, {"id": 2, "time": 2.0}],
+        "sample": {"channel_id": "T", "times": [0.0, 1.0, 2.0],
+                   "intensities": [0.0, 0.0, 1.0]},
+        "candidate_markers": [0.0, 2.0],
+        "saturation": 1000.0,
+        "tolerance": 0.51,
+        "drift_slope": {"min": 0.5, "max": 2.0},
+    }
+    res = solve(payload)
+    assert res["status"] == "ok", res
+    assert res["max_pairs"] == 2
+    comp = res["components"][0]
+    assert comp["ratio_lower"] == pytest.approx(0.49, abs=1e-6)
+    assert comp["ratio_upper"] == pytest.approx(0.51, abs=1e-6)
+    assert comp["concentration_lower"] == pytest.approx(0.49, abs=1e-6)
+    assert comp["concentration_upper"] == pytest.approx(0.51, abs=1e-6)
+
+
+def test_quick_prune_never_discards_lp_feasible_system():
+    # Property: whenever quick_prune reports infeasible, the exact LP over
+    # the same constraints must agree (HiGHS status 2 = infeasible).
+    from app.quant import quick_prune
+    from scipy.optimize import linprog as _lp
+
+    rng = np.random.default_rng(123)
+    for trial in range(400):
+        n_pts = int(rng.integers(1, 40))
+        n_comp = int(rng.integers(1, 4))
+        M = rng.uniform(0.0, 5.0, (n_pts, n_comp))
+        M[rng.random(M.shape) < 0.4] = 0.0  # all-zero / single-support rows
+        y = rng.uniform(-1.0, 20.0, n_pts)
+        sat = float(rng.uniform(15.0, 25.0))
+        tol = float(rng.uniform(0.0, 2.0))
+        if trial % 3 == 0:  # force some saturated points
+            idx = rng.choice(n_pts, size=max(1, n_pts // 5), replace=False)
+            y[idx] = sat + rng.uniform(0.0, 5.0, len(idx))
+        saturated = y >= sat
+
+        if not quick_prune(M, y, saturated, sat, tol):
+            continue
+        a_rows, b_rows = [], []
+        unsat = ~saturated
+        if unsat.any():
+            a_rows += [M[unsat], -M[unsat]]
+            b_rows += [y[unsat] + tol, tol - y[unsat]]
+        if sat - tol > 0 and saturated.any():
+            a_rows.append(-M[saturated])
+            b_rows.append(np.full(int(saturated.sum()), tol - sat))
+        lp = _lp(np.zeros(n_comp), A_ub=np.vstack(a_rows),
+                 b_ub=np.concatenate(b_rows), bounds=[(0, None)] * n_comp,
+                 method="highs")
+        assert lp.status == 2, (
+            f"trial {trial}: quick_prune discarded an LP-feasible system")
+
+
+# --------------------------------------------------------------------------
 # Envelope row-reduction correctness: reduced set == full set on the grid
 # --------------------------------------------------------------------------
 

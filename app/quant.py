@@ -37,7 +37,6 @@ from typing import Any
 
 import numpy as np
 from scipy.optimize import linprog
-from scipy.optimize import nnls
 
 # Matching enumeration depth is bounded by the (potentially large) number of
 # reference markers; keep a comfortable recursion budget.
@@ -267,6 +266,60 @@ def envelope_keep(x0: np.ndarray, x1: np.ndarray, b: np.ndarray,
     return keep
 
 
+def quick_prune(M: np.ndarray, y: np.ndarray, saturated: np.ndarray,
+                sat: float, tol: float) -> bool:
+    """Cheap *provably necessary* conditions before the exact LP.
+
+    True => provably infeasible.  Only logical consequences of single rows
+    (or of one column across rows) of the constraint system are used, so a
+    feasible matching is never discarded; anything uncertain falls through
+    to the exact LP, which is the sole arbiter.  In particular no
+    least-squares fit is consulted: the L2-optimal ratio vector need not
+    minimise the worst pointwise error, so its residual cannot certify
+    infeasibility of other ratios (e.g. template 1 at three points with
+    sample 0, 0, 1: least-squares ratio 1/3 errs by 2/3, yet ratio 0.5
+    errs by only 0.5 everywhere).
+
+    Checks (unsaturated rows require |M r - y| <= tol, r >= 0):
+      * all-zero row: the model predicts 0, hence |y_i| <= tol;
+      * rows whose only positive entry is column k pin r_k to
+        [(y_i - tol)/M_ik, (y_i + tol)/M_ik]; the per-component
+        intersection of those intervals must be non-empty;
+      * saturated row (lower bound M r >= sat - tol > 0 only): at least
+        one entry must be positive.
+    """
+    if sat - tol > 0 and saturated.any():
+        Ms = M[saturated]
+        if Ms.shape[0] and np.any(Ms.max(axis=1) <= 0.0):
+            return True
+    unsat = ~saturated
+    if unsat.any():
+        Mu, yu = M[unsat], y[unsat]
+        nz = Mu != 0.0
+        nnz = nz.sum(axis=1)
+        # All-zero rows: |0 - y_i| <= tol must already hold.
+        if np.any((nnz == 0) & (np.abs(yu) > tol)):
+            return True
+        # Single-support rows: intersect the implied ratio intervals.
+        single = nnz == 1
+        if single.any():
+            r_idx = np.nonzero(single)[0]
+            c_idx = nz[r_idx].argmax(axis=1)
+            mvals = Mu[r_idx, c_idx]
+            pos = mvals > 0.0
+            r_idx, c_idx, mvals = r_idx[pos], c_idx[pos], mvals[pos]
+            lo = (yu[r_idx] - tol) / mvals
+            hi = (yu[r_idx] + tol) / mvals
+            for k in range(M.shape[1]):
+                sel = c_idx == k
+                if sel.any():
+                    k_lo = float(lo[sel].max())
+                    k_hi = float(hi[sel].min())
+                    if k_lo > k_hi + 1e-9 * max(1.0, abs(k_hi)):
+                        return True
+    return False
+
+
 def solve(payload: Any) -> dict:
     started = time.perf_counter()
     data, errors = validate_and_extract(payload)
@@ -362,26 +415,6 @@ def solve(payload: Any) -> dict:
             vals = np.interp(ref_grid, std_t[k], std_y[k], left=0.0, right=0.0)
             M[:, k] = np.where(inside, vals, 0.0)
         return M
-
-    def quick_prune(M: np.ndarray) -> bool:
-        """Cheap necessary condition before the exact LP.
-
-        True => provably infeasible.  NNLS minimises the unconstrained
-        (non-negativity only) residual; if even that fit violates the
-        tolerance on some unsaturated row, no feasible r exists.
-        """
-        if sat - tol > 0 and saturated.any():
-            Ms = M[saturated]
-            if Ms.shape[0] and np.any(Ms.max(axis=1) <= 0.0):
-                return True
-        unsat = ~saturated
-        if unsat.any():
-            Mu, yu = M[unsat], sample_y[unsat]
-            scale = max(float(np.linalg.norm(yu)), 1.0)
-            r_nnls, _ = nnls(Mu / scale, yu / scale, maxiter=200)
-            if np.max(np.abs(Mu @ r_nnls - yu)) > tol * (1.0 + 1e-6) + 1e-7:
-                return True
-        return False
 
     def grouped_rows(A: np.ndarray) -> dict[tuple[int, ...], np.ndarray]:
         groups: dict[tuple[int, ...], list[int]] = {}
@@ -480,7 +513,7 @@ def solve(payload: Any) -> dict:
 
     def evaluate(path: list[tuple[int, int]]) -> dict | None:
         M = build_matrix(path)
-        if quick_prune(M):
+        if quick_prune(M, sample_y, saturated, sat, tol):
             return None
         A_ub, b_ub = build_lp(M)
         ext = exact_bounds(A_ub, b_ub)
